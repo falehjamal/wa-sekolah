@@ -1,15 +1,16 @@
-const {
-    default: makeWASocket,
+import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const path = require('path');
-const fs = require('fs');
-const { updateGatewayStatus } = require('./database');
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import { updateGatewayStatus } from './database.js';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions');
 
 // In-memory store: { instanceKey: { socket, qrCode, status, saveCreds } }
@@ -57,13 +58,13 @@ async function startSession(instanceKey) {
     const socket = makeWASocket({
         version,
         logger,
-        printQRInTerminal: false,
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
         browser: ['Sekolah App', 'Chrome', '10.0'],
         generateHighQualityLinkPreview: false,
+        getMessage: async () => undefined,
     });
 
     session.socket = socket;
@@ -246,7 +247,7 @@ function extractTenantId(instanceKey) {
     return match ? parseInt(match[1], 10) : null;
 }
 
-module.exports = {
+export {
     startSession,
     getSession,
     destroySession,

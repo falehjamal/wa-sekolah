@@ -1,6 +1,6 @@
-const express = require('express');
-const QRCode = require('qrcode');
-const { startSession, getSession, destroySession, sendText, sendMedia } = require('../services/whatsapp');
+import express from 'express';
+import QRCode from 'qrcode';
+import { startSession, getSession, destroySession, sendText, sendMedia } from '../services/whatsapp.js';
 
 const sessionRouter = express.Router();
 const messageRouter = express.Router();
@@ -226,4 +226,4 @@ messageRouter.post('/send-media', async (req, res) => {
     }
 });
 
-module.exports = { sessionRouter, messageRouter };
+export { sessionRouter, messageRouter };

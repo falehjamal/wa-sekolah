@@ -1,7 +1,6 @@
-require('dotenv').config();
-
-const express = require('express');
-const sessionRoutes = require('./routes/session');
+import 'dotenv/config';
+import express from 'express';
+import { sessionRouter, messageRouter } from './routes/session.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -22,8 +21,8 @@ app.use((req, res, next) => {
 });
 
 // Routes
-app.use('/sessions', sessionRoutes.sessionRouter);
-app.use('/messages', sessionRoutes.messageRouter);
+app.use('/sessions', sessionRouter);
+app.use('/messages', messageRouter);
 
 // Health check
 app.get('/health', (_req, res) => {

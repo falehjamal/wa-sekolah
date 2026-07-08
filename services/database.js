@@ -1,4 +1,4 @@
-const mysql = require('mysql2/promise');
+import mysql from 'mysql2/promise';
 
 let pool = null;
 
@@ -37,4 +37,4 @@ async function updateGatewayStatus(tenantId, connected, phone = null) {
     }
 }
 
-module.exports = { updateGatewayStatus };
+export { updateGatewayStatus };

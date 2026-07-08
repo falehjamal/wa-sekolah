@@ -2,13 +2,14 @@
   "name": "wa_sekolah",
   "version": "1.0.0",
   "description": "WhatsApp Gateway Bot untuk Aplikasi Sekolah (Baileys + Express)",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "mysql2": "^3.19.1",
