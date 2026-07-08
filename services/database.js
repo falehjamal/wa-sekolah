@@ -37,4 +37,20 @@ async function updateGatewayStatus(tenantId, connected, phone = null) {
     }
 }
 
-export { updateGatewayStatus };
+/**
+ * Ambil tenant yang pernah aktif untuk restore koneksi saat startup.
+ */
+async function getActiveGateways() {
+    try {
+        const db = getPool();
+        const [rows] = await db.execute(
+            `SELECT tenant_id FROM whatsapp_gateway WHERE status = 1`
+        );
+        return rows;
+    } catch (err) {
+        console.error('[DB] Failed to fetch active gateways:', err.message);
+        return [];
+    }
+}
+
+export { updateGatewayStatus, getActiveGateways };

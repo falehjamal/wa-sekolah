@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import { sessionRouter, messageRouter } from './routes/session.js';
+import { restoreConnections } from './connection.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -29,6 +30,7 @@ app.get('/health', (_req, res) => {
     res.json({ success: true, message: 'WA Gateway is running' });
 });
 
-app.listen(PORT, '127.0.0.1', () => {
+app.listen(PORT, '127.0.0.1', async () => {
     console.log(`[WA Gateway] Server berjalan di http://127.0.0.1:${PORT}`);
+    await restoreConnections();
 });

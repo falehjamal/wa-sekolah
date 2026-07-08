@@ -24,15 +24,26 @@ const NO_RECONNECT_CODES = new Set([
     DisconnectReason.connectionReplaced,
 ]);
 
-// In-memory store: { instanceKey: { socket, qrCode, status, saveCreds } }
 const sessions = new Map();
+const instanceMeta = new Map();
 
-const logger = pino({ level: 'silent' });
+const logger = pino({ level: process.env.WA_LOG_LEVEL || 'silent' });
 
-function clearReconnectTimer(session) {
-    if (session.reconnectTimer) {
-        clearTimeout(session.reconnectTimer);
-        session.reconnectTimer = null;
+function getMeta(instanceKey) {
+    if (!instanceMeta.has(instanceKey)) {
+        instanceMeta.set(instanceKey, {
+            reconnectAttempts: 0,
+            reconnectTimer: null,
+            isStarting: false,
+        });
+    }
+    return instanceMeta.get(instanceKey);
+}
+
+function clearReconnectTimer(meta) {
+    if (meta.reconnectTimer) {
+        clearTimeout(meta.reconnectTimer);
+        meta.reconnectTimer = null;
     }
 }
 
@@ -43,42 +54,37 @@ function wipeSessionFiles(instanceKey) {
     }
 }
 
+function formatDisconnectError(error) {
+    const wsError = error?.data;
+    const parts = [
+        error?.message || 'unknown',
+        wsError?.code ? `wsCode=${wsError.code}` : null,
+        wsError?.errno ? `errno=${wsError.errno}` : null,
+        wsError?.syscall ? `syscall=${wsError.syscall}` : null,
+        wsError?.hostname ? `host=${wsError.hostname}` : null,
+    ].filter(Boolean);
+
+    return parts.join(' | ');
+}
+
 function resetSession(instanceKey, message) {
     const session = sessions.get(instanceKey);
+    const meta = getMeta(instanceKey);
+
+    clearReconnectTimer(meta);
     if (session) {
-        clearReconnectTimer(session);
         try {
             session.socket?.end();
         } catch (_) {}
     }
 
     sessions.delete(instanceKey);
+    instanceMeta.delete(instanceKey);
     wipeSessionFiles(instanceKey);
     console.log(`[${instanceKey}] ${message}`);
 }
 
-/**
- * Get or create a session for the given instance key.
- * Returns the session object.
- */
-async function startSession(instanceKey) {
-    // If already connected, return existing
-    if (sessions.has(instanceKey)) {
-        const existing = sessions.get(instanceKey);
-        if (existing.status === 'connected' && existing.socket) {
-            return existing;
-        }
-        if (existing.status === 'connecting' || existing.status === 'waiting_scan') {
-            return existing;
-        }
-        // If not connected, clean up and recreate
-        clearReconnectTimer(existing);
-        try {
-            existing.socket?.end();
-        } catch (_) {}
-        sessions.delete(instanceKey);
-    }
-
+async function createSocket(instanceKey, session, meta) {
     const sessionDir = path.join(SESSIONS_DIR, instanceKey);
     if (!fs.existsSync(sessionDir)) {
         fs.mkdirSync(sessionDir, { recursive: true });
@@ -87,18 +93,9 @@ async function startSession(instanceKey) {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
-    const session = {
-        socket: null,
-        qrCode: null,
-        status: 'connecting',
-        phone: null,
-        saveCreds,
-        instanceKey,
-        reconnectAttempts: 0,
-        reconnectTimer: null,
-    };
-
-    sessions.set(instanceKey, session);
+    session.saveCreds = saveCreds;
+    session.status = 'connecting';
+    session.qrCode = null;
 
     const socket = makeWASocket({
         version,
@@ -111,6 +108,9 @@ async function startSession(instanceKey) {
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
         markOnlineOnConnect: false,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 30000,
         getMessage: async () => undefined,
     });
 
@@ -129,14 +129,14 @@ async function startSession(instanceKey) {
         if (connection === 'close') {
             const error = lastDisconnect?.error;
             const statusCode = error?.output?.statusCode;
-            const errorMessage = error?.message || 'unknown';
 
             session.status = 'disconnected';
             session.qrCode = null;
 
-            console.log(`[${instanceKey}] Connection closed. Code: ${statusCode ?? 'n/a'}, Reason: ${errorMessage}`);
+            console.log(
+                `[${instanceKey}] Connection closed. Code: ${statusCode ?? 'n/a'}, Detail: ${formatDisconnectError(error)}`
+            );
 
-            // Update DB status to disconnected
             const tenantId = extractTenantId(instanceKey);
             if (tenantId) {
                 await updateGatewayStatus(tenantId, false);
@@ -151,15 +151,15 @@ async function startSession(instanceKey) {
             }
 
             if (NO_RECONNECT_CODES.has(statusCode)) {
-                clearReconnectTimer(session);
+                clearReconnectTimer(meta);
                 sessions.delete(instanceKey);
                 console.log(`[${instanceKey}] Koneksi diganti perangkat lain. Tidak reconnect otomatis.`);
                 return;
             }
 
-            session.reconnectAttempts += 1;
+            meta.reconnectAttempts += 1;
 
-            if (session.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+            if (meta.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
                 resetSession(
                     instanceKey,
                     `Gagal reconnect ${MAX_RECONNECT_ATTEMPTS}x. File sesi dihapus, silakan scan QR ulang.`
@@ -167,56 +167,116 @@ async function startSession(instanceKey) {
                 return;
             }
 
-            const delayMs = Math.min(3000 * session.reconnectAttempts, 15000);
+            const delayMs = Math.min(3000 * meta.reconnectAttempts, 15000);
             console.log(
-                `[${instanceKey}] Reconnecting... (${session.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) dalam ${delayMs / 1000}s`
+                `[${instanceKey}] Reconnecting... (${meta.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) dalam ${delayMs / 1000}s`
             );
 
-            clearReconnectTimer(session);
-            session.reconnectTimer = setTimeout(() => {
-                session.reconnectTimer = null;
-                startSession(instanceKey);
+            clearReconnectTimer(meta);
+            meta.reconnectTimer = setTimeout(() => {
+                meta.reconnectTimer = null;
+                reconnectSession(instanceKey);
             }, delayMs);
         }
 
         if (connection === 'open') {
             session.status = 'connected';
             session.qrCode = null;
-            session.reconnectAttempts = 0;
-            clearReconnectTimer(session);
+            meta.reconnectAttempts = 0;
+            clearReconnectTimer(meta);
 
-            // Extract connected phone number from socket
             const rawId = socket.user?.id || '';
             session.phone = rawId.split(':')[0].split('@')[0] || null;
 
             console.log(`[${instanceKey}] Connected! Phone: ${session.phone}`);
 
-            // Update DB status to connected (with phone)
             const tenantId = extractTenantId(instanceKey);
             if (tenantId) {
                 await updateGatewayStatus(tenantId, true, session.phone);
             }
         }
     });
+}
+
+async function reconnectSession(instanceKey) {
+    const session = sessions.get(instanceKey);
+    if (session) {
+        try {
+            session.socket?.end();
+        } catch (_) {}
+    }
+
+    sessions.delete(instanceKey);
+    await startSession(instanceKey, { fromReconnect: true });
+}
+
+/**
+ * Get or create a session for the given instance key.
+ */
+async function startSession(instanceKey, options = {}) {
+    const meta = getMeta(instanceKey);
+
+    if (!options.fromReconnect) {
+        meta.reconnectAttempts = 0;
+        clearReconnectTimer(meta);
+    }
+
+    if (meta.isStarting) {
+        return sessions.get(instanceKey) || { status: 'connecting', qrCode: null, phone: null };
+    }
+
+    if (sessions.has(instanceKey)) {
+        const existing = sessions.get(instanceKey);
+        if (existing.status === 'connected' && existing.socket) {
+            return existing;
+        }
+        if (existing.status === 'connecting' || existing.status === 'waiting_scan') {
+            return existing;
+        }
+
+        try {
+            existing.socket?.end();
+        } catch (_) {}
+        sessions.delete(instanceKey);
+    }
+
+    meta.isStarting = true;
+
+    const session = {
+        socket: null,
+        qrCode: null,
+        status: 'connecting',
+        phone: null,
+        saveCreds: null,
+        instanceKey,
+    };
+
+    sessions.set(instanceKey, session);
+
+    try {
+        await createSocket(instanceKey, session, meta);
+    } catch (err) {
+        sessions.delete(instanceKey);
+        console.error(`[${instanceKey}] Gagal membuat socket: ${err.message}`);
+        throw err;
+    } finally {
+        meta.isStarting = false;
+    }
 
     return session;
 }
 
-/**
- * Get session info without starting one.
- */
 function getSession(instanceKey) {
     return sessions.get(instanceKey) || null;
 }
 
-/**
- * Logout and destroy a session.
- */
 async function destroySession(instanceKey) {
     const session = sessions.get(instanceKey);
+    const meta = getMeta(instanceKey);
+
+    clearReconnectTimer(meta);
 
     if (session?.socket) {
-        clearReconnectTimer(session);
         try {
             await session.socket.logout();
         } catch (_) {}
@@ -226,9 +286,9 @@ async function destroySession(instanceKey) {
     }
 
     sessions.delete(instanceKey);
+    instanceMeta.delete(instanceKey);
     wipeSessionFiles(instanceKey);
 
-    // Update DB status to disconnected
     const tenantId = extractTenantId(instanceKey);
     if (tenantId) {
         await updateGatewayStatus(tenantId, false);
@@ -237,9 +297,6 @@ async function destroySession(instanceKey) {
     return true;
 }
 
-/**
- * Send a text message.
- */
 async function sendText(instanceKey, phone, message) {
     const session = sessions.get(instanceKey);
 
@@ -253,9 +310,6 @@ async function sendText(instanceKey, phone, message) {
     return { success: true, message: 'Pesan berhasil dikirim.' };
 }
 
-/**
- * Send a media message (image, video, or document).
- */
 async function sendMedia(instanceKey, phone, message, mediaUrl, mediaType) {
     const session = sessions.get(instanceKey);
 
@@ -275,7 +329,6 @@ async function sendMedia(instanceKey, phone, message, mediaUrl, mediaType) {
             break;
         case 'document':
         default:
-            // Send text first if provided, then document
             if (message) {
                 await session.socket.sendMessage(jid, { text: message });
             }
@@ -288,17 +341,11 @@ async function sendMedia(instanceKey, phone, message, mediaUrl, mediaType) {
     return { success: true, message: 'Pesan media berhasil dikirim.' };
 }
 
-/**
- * Format phone number to WhatsApp JID.
- */
 function formatJid(phone) {
-    // Already a JID
     if (phone.includes('@')) return phone;
 
-    // Remove non-numeric characters
     let cleaned = phone.replace(/[^0-9]/g, '');
 
-    // Indonesian phone normalization
     if (cleaned.startsWith('0')) {
         cleaned = '62' + cleaned.substring(1);
     } else if (cleaned.startsWith('8')) {
@@ -308,9 +355,6 @@ function formatJid(phone) {
     return cleaned + '@s.whatsapp.net';
 }
 
-/**
- * Extract tenant ID from instance key (e.g., "sekolah_5" -> 5).
- */
 function extractTenantId(instanceKey) {
     const match = instanceKey.match(/^sekolah_(\d+)$/);
     return match ? parseInt(match[1], 10) : null;
