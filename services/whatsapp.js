@@ -13,10 +13,49 @@ import { updateGatewayStatus } from './database.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions');
 
+const MAX_RECONNECT_ATTEMPTS = 5;
+const FATAL_DISCONNECT_CODES = new Set([
+    DisconnectReason.loggedOut,
+    DisconnectReason.badSession,
+    DisconnectReason.forbidden,
+    DisconnectReason.multideviceMismatch,
+]);
+const NO_RECONNECT_CODES = new Set([
+    DisconnectReason.connectionReplaced,
+]);
+
 // In-memory store: { instanceKey: { socket, qrCode, status, saveCreds } }
 const sessions = new Map();
 
 const logger = pino({ level: 'silent' });
+
+function clearReconnectTimer(session) {
+    if (session.reconnectTimer) {
+        clearTimeout(session.reconnectTimer);
+        session.reconnectTimer = null;
+    }
+}
+
+function wipeSessionFiles(instanceKey) {
+    const sessionDir = path.join(SESSIONS_DIR, instanceKey);
+    if (fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+}
+
+function resetSession(instanceKey, message) {
+    const session = sessions.get(instanceKey);
+    if (session) {
+        clearReconnectTimer(session);
+        try {
+            session.socket?.end();
+        } catch (_) {}
+    }
+
+    sessions.delete(instanceKey);
+    wipeSessionFiles(instanceKey);
+    console.log(`[${instanceKey}] ${message}`);
+}
 
 /**
  * Get or create a session for the given instance key.
@@ -29,7 +68,11 @@ async function startSession(instanceKey) {
         if (existing.status === 'connected' && existing.socket) {
             return existing;
         }
+        if (existing.status === 'connecting' || existing.status === 'waiting_scan') {
+            return existing;
+        }
         // If not connected, clean up and recreate
+        clearReconnectTimer(existing);
         try {
             existing.socket?.end();
         } catch (_) {}
@@ -51,6 +94,8 @@ async function startSession(instanceKey) {
         phone: null,
         saveCreds,
         instanceKey,
+        reconnectAttempts: 0,
+        reconnectTimer: null,
     };
 
     sessions.set(instanceKey, session);
@@ -64,6 +109,8 @@ async function startSession(instanceKey) {
         },
         browser: ['Sekolah App', 'Chrome', '10.0'],
         generateHighQualityLinkPreview: false,
+        syncFullHistory: false,
+        markOnlineOnConnect: false,
         getMessage: async () => undefined,
     });
 
@@ -80,11 +127,14 @@ async function startSession(instanceKey) {
         }
 
         if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            const error = lastDisconnect?.error;
+            const statusCode = error?.output?.statusCode;
+            const errorMessage = error?.message || 'unknown';
 
             session.status = 'disconnected';
             session.qrCode = null;
+
+            console.log(`[${instanceKey}] Connection closed. Code: ${statusCode ?? 'n/a'}, Reason: ${errorMessage}`);
 
             // Update DB status to disconnected
             const tenantId = extractTenantId(instanceKey);
@@ -92,25 +142,48 @@ async function startSession(instanceKey) {
                 await updateGatewayStatus(tenantId, false);
             }
 
-            if (shouldReconnect) {
-                console.log(`[${instanceKey}] Reconnecting...`);
-                // Small delay before reconnect to avoid rapid loops
-                setTimeout(() => startSession(instanceKey), 3000);
-            } else {
-                console.log(`[${instanceKey}] Logged out. Cleaning up session files.`);
-                sessions.delete(instanceKey);
-
-                // Auto-delete session folder so fresh QR is generated next time
-                const sessionDir = path.join(SESSIONS_DIR, instanceKey);
-                if (fs.existsSync(sessionDir)) {
-                    fs.rmSync(sessionDir, { recursive: true, force: true });
-                }
+            if (FATAL_DISCONNECT_CODES.has(statusCode)) {
+                resetSession(
+                    instanceKey,
+                    'Sesi tidak valid. File sesi dihapus, silakan scan QR ulang.'
+                );
+                return;
             }
+
+            if (NO_RECONNECT_CODES.has(statusCode)) {
+                clearReconnectTimer(session);
+                sessions.delete(instanceKey);
+                console.log(`[${instanceKey}] Koneksi diganti perangkat lain. Tidak reconnect otomatis.`);
+                return;
+            }
+
+            session.reconnectAttempts += 1;
+
+            if (session.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+                resetSession(
+                    instanceKey,
+                    `Gagal reconnect ${MAX_RECONNECT_ATTEMPTS}x. File sesi dihapus, silakan scan QR ulang.`
+                );
+                return;
+            }
+
+            const delayMs = Math.min(3000 * session.reconnectAttempts, 15000);
+            console.log(
+                `[${instanceKey}] Reconnecting... (${session.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) dalam ${delayMs / 1000}s`
+            );
+
+            clearReconnectTimer(session);
+            session.reconnectTimer = setTimeout(() => {
+                session.reconnectTimer = null;
+                startSession(instanceKey);
+            }, delayMs);
         }
 
         if (connection === 'open') {
             session.status = 'connected';
             session.qrCode = null;
+            session.reconnectAttempts = 0;
+            clearReconnectTimer(session);
 
             // Extract connected phone number from socket
             const rawId = socket.user?.id || '';
@@ -143,6 +216,7 @@ async function destroySession(instanceKey) {
     const session = sessions.get(instanceKey);
 
     if (session?.socket) {
+        clearReconnectTimer(session);
         try {
             await session.socket.logout();
         } catch (_) {}
@@ -152,12 +226,7 @@ async function destroySession(instanceKey) {
     }
 
     sessions.delete(instanceKey);
-
-    // Remove auth files
-    const sessionDir = path.join(SESSIONS_DIR, instanceKey);
-    if (fs.existsSync(sessionDir)) {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-    }
+    wipeSessionFiles(instanceKey);
 
     // Update DB status to disconnected
     const tenantId = extractTenantId(instanceKey);
