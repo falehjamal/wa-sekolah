@@ -5,16 +5,18 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js",
+    "start": "node --dns-result-order=ipv4first index.js",
+    "dev": "node --dns-result-order=ipv4first --watch index.js",
     "check-network": "node scripts/check-network.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc13",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "https-proxy-agent": "^9.1.0",
     "mysql2": "^3.19.1",
     "pino": "^9.6.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "socks-proxy-agent": "^10.1.0"
   }
 }

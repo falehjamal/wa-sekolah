@@ -9,6 +9,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { updateGatewayStatus } from './database.js';
+import { createWaAgent } from './network.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions');
@@ -97,6 +98,8 @@ async function createSocket(instanceKey, session, meta) {
     session.status = 'connecting';
     session.qrCode = null;
 
+    const agent = createWaAgent();
+
     const socket = makeWASocket({
         version,
         logger,
@@ -111,6 +114,8 @@ async function createSocket(instanceKey, session, meta) {
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
+        agent,
+        fetchAgent: agent,
         getMessage: async () => undefined,
     });
 
